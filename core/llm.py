@@ -6,12 +6,33 @@ import re
 import json
 import urllib.parse
 import numpy as np
-from .config import LLM_URL, LLM_MODEL, FAST_LLM_MODEL, VISION_MODEL, VLM_HEF_PATH, get_system_prompt, get_current_context
+from .config import LLM_URL, LLM_MODEL, FAST_LLM_MODEL, VISION_MODEL, VISION_BACKEND, VLM_HEF_PATH, get_system_prompt, get_current_context
 from .tts import add_pronunciation
 from .search import search_web, search_images
 from .timers import describe_duration, parse_timer_request
 
 logger = logging.getLogger(__name__)
+
+def truncate_repeated_sentences(text):
+    """Stop before a repeated substantial sentence or poem line.
+
+    Ignore action JSON and reasoning, and leave short cheers alone. Return
+    the original text prefix so punctuation and action objects stay intact.
+    """
+    masked = re.sub(r'<think>.*?(?:</think>|$)|\{[^{}]*\}',
+                    lambda m: ' ' * len(m.group()), text,
+                    flags=re.DOTALL | re.IGNORECASE)
+    seen = set()
+    for match in re.finditer(r'[^.!?\n]+(?:[.!?\n]+|$)', masked):
+        words = re.findall(r"\w+", match.group().casefold())
+        key = ' '.join(words)
+        if len(words) < 8 or len(key) < 35:
+            continue
+        if key in seen:
+            return text[:match.start()].rstrip(), True
+        seen.add(key)
+    return text, False
+
 
 # --------------------------------------------------------------------------- #
 #  Hailo VLM (Vision Language Model) singleton
@@ -628,11 +649,12 @@ class Brain:
             "stream": False,
             "options": {
                 "temperature": 0.7,
-                # ~4.5 tok/s on the H10H, so num_predict is a latency budget, not
-                # just a length cap: 1024 meant up to 3.5 min of generation and ~80 s
-                # of rambling audio.  BMO speaks 1-3 sentences (~40-60 tokens); 120
-                # leaves headroom while bounding a runaway turn at ~27 s.
-                "num_predict": 120,
+                # Leave room for complete replies and expression JSON. The old
+                # 120-token cap cut even short poems off mid-sentence. The system
+                # prompt controls brevity; this is a runaway-generation guard.
+                "num_predict": 384,
+                "repeat_penalty": 1.15,
+                "repeat_last_n": 256,
                 "num_ctx": 4096,
             }
         }
@@ -645,6 +667,9 @@ class Brain:
             if response.status_code == 200:
                 data = response.json()
                 content = data.get("message", {}).get("content", "")
+                content, looped = truncate_repeated_sentences(content)
+                if looped:
+                    logger.warning("Stopped repeated sentence in LLM reply")
 
                 # Check if the LLM outputted a JSON action (like search_web)
                 try:
@@ -866,11 +891,12 @@ class Brain:
             "stream": True,
             "options": {
                 "temperature": 0.7,
-                # ~4.5 tok/s on the H10H, so num_predict is a latency budget, not
-                # just a length cap: 1024 meant up to 3.5 min of generation and ~80 s
-                # of rambling audio.  BMO speaks 1-3 sentences (~40-60 tokens); 120
-                # leaves headroom while bounding a runaway turn at ~27 s.
-                "num_predict": 120,
+                # Leave room for complete replies and expression JSON. The old
+                # 120-token cap cut even short poems off mid-sentence. The system
+                # prompt controls brevity; this is a runaway-generation guard.
+                "num_predict": 384,
+                "repeat_penalty": 1.15,
+                "repeat_last_n": 256,
                 "num_ctx": 4096,      # Ensure context window is large enough
             }
         }
@@ -879,6 +905,8 @@ class Brain:
         buffer = ""
         assistant_appended = False
         thinker = ThinkStripper()
+        spoken_content = ""
+        looped = False
 
         try:
             logger.info(f"Stream request to LLM ({chosen_model}): {LLM_URL}")
@@ -888,6 +916,11 @@ class Brain:
                         if line:
                             try:
                                 data = json.loads(line)
+                                if data.get("done"):
+                                    logger.info("LLM finished: reason=%s, tokens=%s",
+                                                data.get("done_reason"), data.get("eval_count"))
+                                    if data.get("done_reason") == "length":
+                                        logger.warning("LLM reply reached its token limit")
                                 chunk = data.get("message", {}).get("content", "")
                                 if not chunk:
                                     continue
@@ -932,18 +965,32 @@ class Brain:
                                     cleaned = strip_prompt_leakage(buffer)
                                     # Ensure BMO spelling before yielding
                                     out_chunk = re.sub(r'\bBeemo\b', 'BMO', cleaned, flags=re.IGNORECASE)
+                                    safe, looped = truncate_repeated_sentences(spoken_content + out_chunk)
+                                    out_chunk = safe[len(spoken_content):]
+                                    spoken_content = safe
+                                    buffer = ""
+                                    if looped:
+                                        full_content, _ = truncate_repeated_sentences(full_content)
+                                        response.close()
+                                        logger.warning("Stopped repeated sentence in LLM stream")
                                     if out_chunk.strip():
                                         yield out_chunk
-                                    buffer = ""
+                                    if looped:
+                                        break
                                     
                             except json.JSONDecodeError:
                                 pass
                                 
                     # Yield any remaining buffer (plus text held back by the filter)
-                    buffer += thinker.flush()
+                    buffer += "" if looped else thinker.flush()
                     if buffer.strip():
                         cleaned = strip_prompt_leakage(buffer)
                         out_chunk = re.sub(r'\bBeemo\b', 'BMO', cleaned, flags=re.IGNORECASE)
+                        safe, tail_looped = truncate_repeated_sentences(spoken_content + out_chunk)
+                        out_chunk = safe[len(spoken_content):]
+                        if tail_looped:
+                            full_content, _ = truncate_repeated_sentences(full_content)
+                            logger.warning("Stopped repeated sentence at end of LLM stream")
                         if out_chunk.strip():
                             yield out_chunk
 
@@ -983,7 +1030,7 @@ class Brain:
             # either record what we got OR pop the dangling user message.
             if not assistant_appended:
                 if full_content.strip():
-                    salvaged = strip_think_blocks(full_content) or full_content
+                    salvaged, _ = truncate_repeated_sentences(strip_think_blocks(full_content) or full_content)
                     self.history.append({"role": "assistant", "content": salvaged})
                 else:
                     # Drop the unmatched user message we appended at function start
@@ -1019,6 +1066,22 @@ class Brain:
         assistant_appended = False
 
         try:
+            if VISION_BACKEND == "ollama":
+                response = requests.post(LLM_URL, json={
+                    "model": VISION_MODEL,
+                    "messages": [{"role": "user", "content": user_text or "Describe this image briefly.",
+                                  "images": [image_base64]}],
+                    "stream": False,
+                    "options": {"num_predict": 100, "num_ctx": 2048, "num_thread": 4},
+                }, timeout=(10, 180))
+                response.raise_for_status()
+                content = response.json()["message"]["content"].strip()
+                if not content:
+                    raise ValueError("Vision model returned an empty response")
+                self.history.append({"role": "assistant", "content": content})
+                assistant_appended = True
+                return content
+
             vlm, frame_shape, frame_dtype = _get_vlm()
 
             # Decode the base64 image into a numpy frame the VLM expects

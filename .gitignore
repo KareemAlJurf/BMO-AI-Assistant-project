@@ -28,6 +28,9 @@ piper/
 # Keep chat history local (Privacy)
 memory.json
 chat_memory.json
+# Local conversation backups must stay private too.
+memory.*.json
+chat_memory.*.json
 # Per-device user preferences (volume level, etc.)
 settings.json
 

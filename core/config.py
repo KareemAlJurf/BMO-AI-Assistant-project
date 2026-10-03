@@ -13,10 +13,11 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # LLM Settings
 # To offload to your Linux server, change this to: "http://blackbox.clevercode.ts.net:11434/api/chat"
 # Make sure Ollama is running on the blackbox server and listening on 0.0.0.0
-LLM_URL = "http://127.0.0.1:8000/api/chat"
-LLM_MODEL = "qwen3:1.7b" # Native Hailo model for all queries
-FAST_LLM_MODEL = "qwen3:1.7b" # Unify models to prevent NPU swap crashing
-VISION_MODEL = "qwen2-vl-instruct:2b" # Legacy Ollama name (unused — VLM runs via HailoRT directly)
+LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:8000/api/chat")
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3:1.7b")
+FAST_LLM_MODEL = os.environ.get("FAST_LLM_MODEL", LLM_MODEL)
+VISION_MODEL = os.environ.get("VISION_MODEL", "qwen2-vl-instruct:2b")
+VISION_BACKEND = os.environ.get("VISION_BACKEND", "hailo")
 
 # VLM (Vision Language Model) Settings — uses HailoRT Python API directly
 # The HEF file is a precompiled model binary from Hailo's model zoo
@@ -217,8 +218,12 @@ def _audio_devices():
 def __getattr__(name):
     """Module-level lazy attributes (PEP 562)."""
     if name == "MIC_DEVICE_INDEX":
+        if "MIC_DEVICE_INDEX" in os.environ:
+            return int(os.environ["MIC_DEVICE_INDEX"])
         return _audio_devices()[0]
     if name == "ALSA_DEVICE":
+        if "ALSA_DEVICE" in os.environ:
+            return os.environ["ALSA_DEVICE"]
         return _audio_devices()[1]
     raise AttributeError(f"module 'core.config' has no attribute {name!r}")
 
@@ -227,5 +232,4 @@ def __getattr__(name):
 # the Gnome volume slider has no effect — adjust this value to change BMO's
 # output level instead.  Default 0.75 leaves headroom to avoid clipping.
 VOLUME = 0.75
-
 

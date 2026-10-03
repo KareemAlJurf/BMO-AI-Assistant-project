@@ -1,17 +1,11 @@
 #!/bin/bash
-echo "Starting BMO Web UI..."
-
-# Check if venv exists
-if [ ! -d "venv" ]; then
-    echo "Virtual environment not found. Please run ./setup_web.sh first."
-    exit 1
-fi
-
-# Activate the virtual environment
-source venv/bin/activate
-
-# Ensure requirements are up to date
-pip install -r requirements.txt > /dev/null 2>&1
-
-# Run the web app
-python3 web_app.py
+set -euo pipefail
+BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$BASE_DIR"
+systemctl --user start be-more-hailo-ollama.service
+for attempt in {1..30}; do
+    if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
+    sleep 1
+done
+curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+exec "$BASE_DIR/venv/bin/python" -m uvicorn web_app:app --host 127.0.0.1 --port 8080 "$@"

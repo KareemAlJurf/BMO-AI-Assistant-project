@@ -115,6 +115,9 @@ class BotGUI:
 
         # Audio State
         self.active_sounds = []
+        self._music_process = None
+        self._music_generation = 0
+        self._music_lock = threading.Lock()
         self.current_audio_process = None
         self.tts_queue = []
         
@@ -205,8 +208,14 @@ class BotGUI:
         self._volume_overlay = None
         self._volume_hide_job = None
 
-        # Use a master click handler for hot corners and muting
+        # Use a master click handler for hot corners and tap-to-speak
         master.bind('<Button-1>', self.handle_click)
+        self._controller_held = set()
+        self._controller_releases = {}
+        self._controller_wake_job = None
+        master.bind('<KeyPress>', self._controller_press, add='+')
+        master.bind('<KeyRelease>', self._controller_release, add='+')
+        master.bind('<FocusOut>', self._controller_focus_out, add='+')
 
         self.animations = {}
         self.current_frame = 0
@@ -253,6 +262,9 @@ class BotGUI:
     def exit_fullscreen(self, event=None):
         # Signal all background threads to wind down before tearing the UI.
         self.stop_event.set()
+        if self._controller_wake_job is not None:
+            self.master.after_cancel(self._controller_wake_job)
+            self._controller_wake_job = None
         # Best-effort kill of any running audio so we don't leave aplay holding the device.
         try:
             self._kill_tts_pipeline()
@@ -337,23 +349,130 @@ class BotGUI:
             ack_proc = self.play_sound("ack_sounds")
             if ack_proc:
                 ack_proc.wait()
+            clips_played = 0
             while self.current_state == BotStates.THINKING and self.is_thinking_sound_playing:
+                # Leave breathing room after the acknowledgement and each clip.
+                # Long waits get quieter instead of filling every second with speech.
+                gap_total = random.uniform(3.0, 5.0) + min(clips_played * 1.5, 7.0)
+                deadline = time.monotonic() + gap_total
+                while time.monotonic() < deadline:
+                    if (self.current_state != BotStates.THINKING
+                            or not self.is_thinking_sound_playing
+                            or self.stop_event.wait(0.1)):
+                        return
+                if (self.current_state != BotStates.THINKING
+                        or not self.is_thinking_sound_playing or self.stop_event.is_set()):
+                    return
                 self.thinking_audio_process = self.play_sound("thinking_sounds")
                 if self.thinking_audio_process:
                     self.thinking_audio_process.wait()
-                # Randomized 0.4–1.2 s gap between repeats — feels alive
-                gap_total = random.uniform(0.4, 1.2)
-                elapsed = 0.0
-                while elapsed < gap_total:
-                    if self.current_state != BotStates.THINKING or not self.is_thinking_sound_playing:
-                        break
-                    time.sleep(0.1)
-                    elapsed += 0.1
+                clips_played += 1
         finally:
             self.thinking_audio_process = None
 
+    def _controller_key(self, event):
+        # The Feather M0 / CircuitPython 5.2 descriptor supports F6-F12.
+        # Normalize these to the existing action IDs used below.
+        if event.keysym in {"F6", "F7", "F8", "F9", "F10", "F11", "F12"}:
+            return "F" + str(int(event.keysym[1:]) + 7)
+        if event.keysym in {"F13", "F14", "F15", "F16", "F17", "F18", "F19"}:
+            return event.keysym
+        # X11's default map can name these keys XF86Tools/Launch/etc.
+        # Linux evdev F13-F19 (183-189) have an X11 keycode offset of 8.
+        if self.master.tk.call("tk", "windowingsystem") == "x11":
+            if 191 <= event.keycode <= 197:
+                return "F" + str(event.keycode - 178)
+        return None
+
+    def _controller_press(self, event):
+        key = self._controller_key(event)
+        if key is None:
+            return
+        pending = self._controller_releases.pop(key, None)
+        if pending is not None:
+            self.master.after_cancel(pending)
+        if key in self._controller_held:
+            return "break"
+        self._controller_held.add(key)
+        self.last_user_interaction = time.time()
+        if key == "F13":
+            self.trigger_random_thought()
+        elif key == "F14":
+            self.mute_bmo()
+        elif key == "F15":
+            if self._controller_wake_job is not None:
+                self.master.after_cancel(self._controller_wake_job)
+                self._controller_wake_job = None
+                self.exit_fullscreen()
+            else:
+                # Wait briefly so a double press quits without starting the mic.
+                self._controller_wake_job = self.master.after(
+                    450, self._controller_listen)
+        elif key in {"F16", "F17"}:
+            delta = 0.1 if key == "F16" else -0.1
+            self.volume = max(0.0, min(1.0, round(self.volume + delta, 2)))
+            self._show_volume_overlay()
+            self._on_vol_release(None)
+        elif key == "F18":
+            self.stop_music()
+        elif key == "F19":
+            self.trigger_music()
+        return "break"
+
+    def _controller_listen(self):
+        self._controller_wake_job = None
+        if not self.stop_event.is_set() and not self.is_busy and self.current_state not in {
+            BotStates.WARMUP, BotStates.LISTENING, BotStates.THINKING,
+            BotStates.SPEAKING, BotStates.CAPTURING,
+        }:
+            self.manual_wake_event.set()
+
+    def _controller_release(self, event):
+        key = self._controller_key(event)
+        if key is None:
+            return
+        # X11 autorepeat emits release/press pairs. Wait until idle before
+        # accepting the release so holding mute cannot toggle it repeatedly.
+        def released():
+            self._controller_releases.pop(key, None)
+            self._controller_held.discard(key)
+        old = self._controller_releases.pop(key, None)
+        if old is not None:
+            self.master.after_cancel(old)
+        self._controller_releases[key] = self.master.after_idle(released)
+        return "break"
+
+    def _controller_focus_out(self, event):
+        if self._controller_wake_job is not None:
+            self.master.after_cancel(self._controller_wake_job)
+            self._controller_wake_job = None
+        for pending in self._controller_releases.values():
+            self.master.after_cancel(pending)
+        self._controller_releases.clear()
+        self._controller_held.clear()
+
+    def stop_music(self, event=None):
+        # Also cancels music queued behind its spoken introduction.
+        with self._music_lock:
+            self._music_generation += 1
+            proc = self._music_process
+            self._music_process = None
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+        if self.current_state == BotStates.JAMMING:
+            self.set_state(BotStates.IDLE, "Music stopped")
+
+    def _play_music_generation(self, generation):
+        with self._music_lock:
+            if generation != self._music_generation or self.stop_event.is_set():
+                return None
+            return self.play_sound("music")
+
     def handle_click(self, event):
-        """Map screen clicks to hot corners, mouth-tap mute, or tap-to-speak."""
+        """Map screen clicks to hot corners or tap-to-speak; mute is button-only."""
         now = time.time()
 
         # Triple-tap anywhere within 0.8 s → clean exit (useful without keyboard)
@@ -402,13 +521,12 @@ class BotGUI:
         elif x > win_w - corner_w and y > win_h - corner_h:
             print(f"[CLICK] Bottom-Right: Play Music ({x},{y})")
             self.trigger_music()
-        elif x < corner_w and y > win_h - corner_h:
-            print(f"[CLICK] Bottom-Left: Toggle Mute ({x},{y})")
-            self.mute_bmo()
-        elif in_mouth:
-            # Tap BMO's mouth to toggle mute — works in any state
-            print(f"[CLICK] Mouth: Toggle Mute ({x},{y})")
-            self.mute_bmo()
+        elif (x < corner_w and y > win_h - corner_h) or in_mouth:
+            # These former mute zones can receive unwanted touch clicks.
+            # Reserve mute for the physical small circle; do not turn these
+            # clicks into a wake request either.
+            print(f"[CLICK] Former mute zone ignored ({x},{y})")
+            return
         elif self.current_state in [BotStates.IDLE, BotStates.SCREENSAVER]:
             print(f"[CLICK] Body: Manual Wake ({x},{y})")
             self.manual_wake_event.set()
@@ -526,7 +644,9 @@ class BotGUI:
         else:
             self._update_volume_visual()
             self._volume_overlay.place(relx=0.5, rely=0.02, anchor=tk.N)
-            self._volume_overlay.tkraise()
+            # Canvas.tkraise raises canvas items and needs a tag. Raise the
+            # widget itself; otherwise TclError prevents the hide timer reset.
+            tk.Misc.tkraise(self._volume_overlay)
         self._reset_volume_hide()
 
     def _hide_volume_overlay(self):
@@ -600,7 +720,7 @@ class BotGUI:
     def _reset_volume_hide(self):
         if self._volume_hide_job:
             self.master.after_cancel(self._volume_hide_job)
-        self._volume_hide_job = self.master.after(6000, self._hide_volume_overlay)
+        self._volume_hide_job = self.master.after(3000, self._hide_volume_overlay)
 
     def _persist_volume(self):
         self._volume_save_job = None
@@ -615,7 +735,9 @@ class BotGUI:
         """Toggle audio mute. Heavy cleanup is dispatched to a worker so the
         Tk thread (and the rest of the UI) never blocks on proc.wait/join."""
         self.is_muted = not self.is_muted
+        print(f"[MUTE] Small-circle button: {'muted' if self.is_muted else 'unmuted'}", flush=True)
         if self.is_muted:
+            self.stop_music()
             self.mute_label.place(relx=0.95, rely=0.05, anchor=tk.NE)
 
             old_state = self.current_state
@@ -659,6 +781,8 @@ class BotGUI:
 
     # --- ANIMATION & SOUND ENGINE ---
     def load_sounds(self):
+        self._thinking_sound_bag = []
+        self._last_thinking_sound = None
         self.sounds = {
             "greeting_sounds": [],
             "ack_sounds": [],
@@ -671,13 +795,60 @@ class BotGUI:
             if os.path.exists(path):
                 self.sounds[category] = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith('.wav')]
 
+    def _start_sound_playback(self, sound_file):
+        """Stream WAV samples so the volume controls also affect music/clips."""
+        source = wave.open(sound_file, "rb")
+        try:
+            if source.getsampwidth() != 2 or source.getcomptype() != "NONE":
+                raise ValueError("BMO sound clips must use uncompressed 16-bit PCM")
+            proc = subprocess.Popen(
+                ['aplay', '-D', ALSA_DEVICE, '-q', '-t', 'raw', '-f', 'S16_LE',
+                 '-r', str(source.getframerate()), '-c', str(source.getnchannels()),
+                 '--buffer-time=500000'], stdin=subprocess.PIPE)
+        except Exception:
+            source.close()
+            raise
+
+        def feed_audio():
+            try:
+                with source:
+                    while not self.stop_event.is_set() and not self.is_muted:
+                        data = source.readframes(2048)
+                        if not data:
+                            break
+                        samples = np.frombuffer(data, dtype='<i2')
+                        data = (samples.astype(np.float32) * self.volume).clip(
+                            -32768, 32767).astype('<i2').tobytes()
+                        proc.stdin.write(data)
+            except (BrokenPipeError, OSError):
+                pass  # Stop/mute terminates aplay while this worker is feeding it.
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+        threading.Thread(target=feed_audio, daemon=True).start()
+        return proc
+
     def play_sound(self, category):
         if self.is_muted:
             return None
         sounds = self.sounds.get(category, [])
         if not sounds:
             return None
-        sound_file = random.choice(sounds)
+        if category == "thinking_sounds":
+            # Keep the bag across turns: hear every clip before repeating one.
+            if not self._thinking_sound_bag:
+                self._thinking_sound_bag = list(sounds)
+                random.shuffle(self._thinking_sound_bag)
+                if (len(self._thinking_sound_bag) > 1
+                        and self._thinking_sound_bag[-1] == self._last_thinking_sound):
+                    self._thinking_sound_bag[0], self._thinking_sound_bag[-1] = (
+                        self._thinking_sound_bag[-1], self._thinking_sound_bag[0])
+            sound_file = self._thinking_sound_bag.pop()
+            self._last_thinking_sound = sound_file
+        else:
+            sound_file = random.choice(sounds)
         try:
             # For pre-recorded sounds, we'll manually set mouth_open to animate
             # while the sound plays, since aplay doesn't give us volume data.
@@ -688,8 +859,10 @@ class BotGUI:
                     time.sleep(0.08)
                 self.mouth_open = 0
 
-            proc = subprocess.Popen(['aplay', '-D', ALSA_DEVICE, '-q', '--buffer-time=500000', sound_file])
+            proc = self._start_sound_playback(sound_file)
             self.active_sounds.append(proc)
+            if category == "music":
+                self._music_process = proc
             
             # Start mouth animation thread for this sound
             if category in ["greeting_sounds", "thinking_sounds"]:
@@ -707,8 +880,12 @@ class BotGUI:
                     except Exception: pass
                 if proc in self.active_sounds:
                     self.active_sounds.remove(proc)
-                if category == "music" and self.current_state == BotStates.JAMMING:
-                    self.set_state(BotStates.IDLE, "Tap to speak")
+                if category == "music":
+                    with self._music_lock:
+                        if self._music_process is proc:
+                            self._music_process = None
+                            if self.current_state == BotStates.JAMMING:
+                                self.set_state(BotStates.IDLE, "Tap to speak")
             threading.Thread(target=cleanup, daemon=True).start()
             return proc
         except Exception as e:
@@ -997,13 +1174,20 @@ class BotGUI:
         print("Recording...")
         filename = "input.wav"
         frames = []
-        silent_chunks = 0
-        has_spoken = False
+        from core.recording import SilenceDetector
+        detector = SilenceDetector(
+            MIC_SAMPLE_RATE,
+            threshold=float(os.environ.get("BMO_SPEECH_THRESHOLD", "300")),
+            silence_seconds=float(os.environ.get("BMO_SILENCE_SECONDS", "0.8")),
+        )
+        recording_done = threading.Event()
         total_samples = 0
         MAX_SAMPLES = MIC_SAMPLE_RATE * 15  # 15-second hard cap
 
         def callback(indata, frames_count, time, status):
-            nonlocal silent_chunks, has_spoken, total_samples
+            nonlocal total_samples
+            if recording_done.is_set():
+                return
             vol = np.linalg.norm(indata)
             # Update mouth_open for real-time lip sync during recording (listening mode)
             if self.current_state == BotStates.LISTENING:
@@ -1011,11 +1195,8 @@ class BotGUI:
 
             frames.append(indata.copy())
             total_samples += indata.shape[0]
-            if vol < 500: # Silence threshold
-                silent_chunks += 1
-            else:
-                silent_chunks = 0
-                has_spoken = True
+            if detector.update(indata):
+                recording_done.set()
 
         retry_count = 0
         while retry_count < 3:
@@ -1025,8 +1206,9 @@ class BotGUI:
                     last_callback_at = time.time()
                     while not self.stop_event.is_set():
                         sd.sleep(50)
-                        if not has_spoken and silent_chunks > 100: break
-                        if has_spoken and silent_chunks > 40: break
+                        if recording_done.is_set():
+                            print(f"[REC] Stopped after quiet at {total_samples / MIC_SAMPLE_RATE:.2f}s")
+                            break
                         if total_samples >= MAX_SAMPLES: break  # 15-second hard cap (sample-accurate)
                         # Watchdog: if the callback stops firing mid-recording
                         # (USB unplug, driver crash) the polling loop would hang.
@@ -1555,7 +1737,9 @@ class BotGUI:
             try:
                 if not self.is_muted:
                     # Lazily start the pipeline on the first sentence of a turn
-                    if self._piper_proc is None or self._piper_proc.poll() is not None:
+                    # A warmed Piper still needs its reader and audio player wired up.
+                    if (self._piper_proc is None or self._piper_proc.poll() is not None
+                            or self._piper_reader_thread is None or self._tts_aplay is None):
                         self._start_tts_turn()
                         if self._piper_proc is None:
                             # Failed to start — skip audio, still transition state
@@ -1630,12 +1814,12 @@ class BotGUI:
                     self.set_state(expr, f"Feeling {expr}...")
                 chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
             elif action_data.get("action") == "play_music":
+                music_generation = self._music_generation
                 def music_worker():
                     if not self._wait_until_idle({BotStates.SPEAKING, BotStates.THINKING}):
                         return  # shutdown
-                    music_proc = self.play_sound("music")
+                    music_proc = self._play_music_generation(music_generation)
                     if music_proc:
-                        self.set_state(BotStates.JAMMING, "Jamming!")
                         try:
                             music_proc.wait(timeout=600)
                         except subprocess.TimeoutExpired:
@@ -1669,7 +1853,7 @@ class BotGUI:
 
         # 2. Speak the remaining text
         if chunk.strip():
-            self.speak(chunk, msg=None, end_of_turn=is_last)
+            self.speak(chunk, end_of_turn=is_last)
         elif is_last:
             # Last chunk was a pure JSON action with no spoken text.  Close any
             # open TTS pipeline so piper+aplay don't stay open holding ALSA.
@@ -1885,10 +2069,6 @@ class BotGUI:
 
     def trigger_random_thought(self, event=None):
         """Manually trigger a random pondering thought (BMO's red button)."""
-        # Quiet Hours: 8 PM to 8 AM
-        _hour = datetime.datetime.now().hour
-        if _hour >= 20 or _hour < 8:
-            return
         if self.current_state in [BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING]:
             return
         if not self._try_claim_busy():
@@ -1960,10 +2140,12 @@ class BotGUI:
 
     def trigger_music(self, event=None):
         """Manually trigger BMO to play music and jam."""
-        if self.current_state in [BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING, BotStates.JAMMING]:
+        if self.is_muted or self.current_state in [BotStates.WARMUP, BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING, BotStates.JAMMING]:
             return
         if not self._try_claim_busy():
             return
+
+        music_generation = self._music_generation
 
         def run_music():
             try:
@@ -1978,9 +2160,8 @@ class BotGUI:
                 ]
                 self.speak(random.choice(intros), msg="Getting ready to jam...")
                 print("[MUSIC] Starting music playback...")
-                music_proc = self.play_sound("music")
+                music_proc = self._play_music_generation(music_generation)
                 if music_proc:
-                    self.set_state(BotStates.JAMMING, "Jamming!")
                     try:
                         music_proc.wait(timeout=600)
                     except subprocess.TimeoutExpired:
@@ -1989,8 +2170,10 @@ class BotGUI:
                     time.sleep(1) # Extra buffer
                     if self.current_state == BotStates.JAMMING:
                         self.set_state(BotStates.IDLE, "Tap to speak")
-                else:
+                elif music_generation == self._music_generation and not self.is_muted:
                     self.speak("BMO wants to play music, but there are no songs loaded!")
+                elif not self.is_muted and self.current_state == BotStates.SPEAKING:
+                    self.set_state(BotStates.IDLE, "Music stopped")
             finally:
                 self._release_busy()
 
@@ -2427,4 +2610,3 @@ if __name__ == "__main__":
     # cleanup path as the Escape key — flushes memory.json, kills aplay, etc.
     root.protocol("WM_DELETE_WINDOW", app.exit_fullscreen)
     root.mainloop()
-

@@ -11,6 +11,18 @@ This fork adds a browser-based **web interface**, a shared `core/` module layer 
 
 ---
 
+## Local CPU build and physical controls
+
+The current launchers use standard Ollama on the Raspberry Pi CPU. See
+[LOCAL_SETUP.md](LOCAL_SETUP.md) for this setup, [.env.cpu.example](.env.cpu.example)
+for model/audio settings, and [BMO_CHANGE_HISTORY.md](BMO_CHANGE_HISTORY.md) for
+the full change record. The Hailo sections below describe the inherited setup.
+
+This version adds CPU vision support, recording and speech fixes, response
+repetition protection, seven physical button actions, live volume control for
+music, automatic volume-bar dismissal, and double-press exit. See the
+[controller guide](firmware/bmo_controller/README.md) for wiring and controls.
+
 ## My Additions
 
 I added custom battery and power-management support for my physical BMO build using the **Geekworm X1203 UPS**.

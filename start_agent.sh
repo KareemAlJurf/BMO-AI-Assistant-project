@@ -1,36 +1,12 @@
 #!/bin/bash
 set -euo pipefail
-
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$BASE_DIR"
-
-# Activate virtual environment if it exists
-if [ -d "venv" ]; then
-    source venv/bin/activate
-    # Ensure requirements are up to date
-    pip install -r requirements.txt > /dev/null 2>&1
-fi
-
-# Ensure model is available
-# SKIPPED: Hailo server reports model "in store" but API returns empty list/500 on pull.
-# Assuming model is present based on server logs to allow boot.
-
-# --- AUTO-Start LLM Server (hailo-ollama on port 8000) ---
-if ! lsof -i :8000 >/dev/null; then
-    echo "Starting hailo-ollama server on port 8000..."
-    export OLLAMA_HOST=0.0.0.0:8000
-    nohup hailo-ollama serve > /tmp/ollama.log 2>&1 &
-    # Give it a moment to initialize
-    sleep 5
-else
-    echo "LLM Server already running on port 8000."
-fi
-
-# Set display for GUI if not set (assuming user is logged in on :0)
-if [ -z "${DISPLAY:-}" ]; then
-    export DISPLAY=:0
-fi
-
-# Run the agent using python3 (Use new Hailo optimized agent)
-exec python3 agent_hailo.py "$@"
-
+systemctl --user start be-more-hailo-ollama.service
+for attempt in {1..30}; do
+    if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then break; fi
+    sleep 1
+done
+curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+export DISPLAY="${DISPLAY:-:0}"
+exec "$BASE_DIR/venv/bin/python" agent_hailo.py "$@"
