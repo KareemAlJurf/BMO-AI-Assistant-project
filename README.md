@@ -126,6 +126,7 @@ My physical BMO build uses:
 - Raspberry Pi 5
 - Raspberry Pi AI HAT 2+ / Hailo-10H
 - Geekworm X1203 UPS
+- Custom PCB
 - Rechargeable battery
 - 5-inch DSI touchscreen
 - Raspberry Pi Camera Module
