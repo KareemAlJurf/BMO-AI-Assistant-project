@@ -9,6 +9,13 @@ A fork of [@brenpoly's be-more-agent](https://github.com/brenpoly/be-more-agent)
 
 This fork adds a browser-based **web interface**, a shared `core/` module layer used by both interfaces, updated support for the Hailo NPU hardware, and additional hardware features for my physical BMO build.
 
+## My BMO Build
+
+<p align="center">
+  <img src="BMOimg1.png" width="45%" alt="BMOimg1" />
+  <img src="BMOimg2.png" width="45%" alt="BMOimg2" />
+</p>
+
 ---
 
 ## Local CPU build and physical controls
